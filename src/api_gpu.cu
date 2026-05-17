@@ -23,6 +23,8 @@ public:
 
     // accept numpy array (cpu) to init 
     cuBVHImpl(Ref<const Verts> vertices, Ref<const Trigs> triangles) : cuBVH() {
+        device_index = at::cuda::current_device();
+        c10::cuda::CUDAGuard device_guard(c10::Device(c10::kCUDA, device_index));
 
         const size_t n_vertices = vertices.rows();
         const size_t n_triangles = triangles.rows();
@@ -48,11 +50,12 @@ public:
 
     void ray_trace(at::Tensor rays_o, at::Tensor rays_d, at::Tensor positions, at::Tensor face_id, at::Tensor depth) {
 
-        assert(rays_o.is_cuda());
-        assert(rays_d.device() == rays_o.device());
-        assert(positions.device() == rays_o.device());
-        assert(face_id.device() == rays_o.device());
-        assert(depth.device() == rays_o.device());
+        TORCH_CHECK(rays_o.is_cuda(), "rays_o must be CUDA");
+        TORCH_CHECK(rays_d.device() == rays_o.device(), "rays_d must be on the same CUDA device as rays_o");
+        TORCH_CHECK(positions.device() == rays_o.device(), "positions must be on the same CUDA device as rays_o");
+        TORCH_CHECK(face_id.device() == rays_o.device(), "face_id must be on the same CUDA device as rays_o");
+        TORCH_CHECK(depth.device() == rays_o.device(), "depth must be on the same CUDA device as rays_o");
+        TORCH_CHECK(rays_o.get_device() == device_index, "rays_o must be on the cuBVH owning CUDA device");
         c10::cuda::CUDAGuard device_guard{rays_o.device()};
         const uint32_t n_elements = rays_o.size(0);
         cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
@@ -62,10 +65,11 @@ public:
 
     void unsigned_distance(at::Tensor positions, at::Tensor distances, at::Tensor face_id, at::optional<at::Tensor> uvw) {
 
-        assert(positions.is_cuda());
-        assert(distances.device() == positions.device());
-        assert(face_id.device() == positions.device());
-        assert(!uvw.has_value() || uvw.value().device() == positions.device());
+        TORCH_CHECK(positions.is_cuda(), "positions must be CUDA");
+        TORCH_CHECK(distances.device() == positions.device(), "distances must be on the same CUDA device as positions");
+        TORCH_CHECK(face_id.device() == positions.device(), "face_id must be on the same CUDA device as positions");
+        TORCH_CHECK(!uvw.has_value() || uvw.value().device() == positions.device(), "uvw must be on the same CUDA device as positions");
+        TORCH_CHECK(positions.get_device() == device_index, "positions must be on the cuBVH owning CUDA device");
         c10::cuda::CUDAGuard device_guard{positions.device()};
         const uint32_t n_elements = positions.size(0);
         cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
@@ -76,10 +80,11 @@ public:
 
     void signed_distance(at::Tensor positions, at::Tensor distances, at::Tensor face_id, at::optional<at::Tensor> uvw, uint32_t mode) {
 
-        assert(positions.is_cuda());
-        assert(distances.device() == positions.device());
-        assert(face_id.device() == positions.device());
-        assert(!uvw.has_value() || uvw.value().device() == positions.device());
+        TORCH_CHECK(positions.is_cuda(), "positions must be CUDA");
+        TORCH_CHECK(distances.device() == positions.device(), "distances must be on the same CUDA device as positions");
+        TORCH_CHECK(face_id.device() == positions.device(), "face_id must be on the same CUDA device as positions");
+        TORCH_CHECK(!uvw.has_value() || uvw.value().device() == positions.device(), "uvw must be on the same CUDA device as positions");
+        TORCH_CHECK(positions.get_device() == device_index, "positions must be on the cuBVH owning CUDA device");
         c10::cuda::CUDAGuard device_guard{positions.device()};
         const uint32_t n_elements = positions.size(0);
         cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
@@ -90,6 +95,7 @@ public:
     std::vector<Triangle> triangles_cpu;
     GPUMemory<Triangle> triangles_gpu;
     std::shared_ptr<TriangleBvh> triangle_bvh;
+    int device_index = -1;
 };
     
 cuBVH* create_cuBVH(Ref<const Verts> vertices, Ref<const Trigs> triangles) {
@@ -99,8 +105,8 @@ cuBVH* create_cuBVH(Ref<const Verts> vertices, Ref<const Trigs> triangles) {
 at::Tensor floodfill(at::Tensor grid) {
 
     // assert grid is uint8_t
-    assert(grid.is_cuda());
-    assert(grid.dtype() == at::ScalarType::Bool);
+    TORCH_CHECK(grid.is_cuda(), "grid must be CUDA");
+    TORCH_CHECK(grid.dtype() == at::ScalarType::Bool, "grid must be bool");
     c10::cuda::CUDAGuard device_guard{grid.device()};
 
     const int B = grid.size(0);

@@ -34,6 +34,7 @@
 #include <gpu/common.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/ThrustAllocator.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <torch/extension.h>
 #include <torch/torch.h>
 #include <atomic>
@@ -96,6 +97,7 @@ class GPUMemory {
 private:
     T* m_data = nullptr;
     size_t m_size = 0; // Number of elements
+    int m_device_index = -1;
     bool m_owned = true;
 
 public:
@@ -104,6 +106,7 @@ public:
     GPUMemory<T>& operator=(GPUMemory<T>&& other) {
         std::swap(m_data, other.m_data);
         std::swap(m_size, other.m_size);
+        std::swap(m_device_index, other.m_device_index);
         return *this;
     }
 
@@ -111,7 +114,7 @@ public:
         *this = std::move(other);
     }
 
-    __host__ __device__ GPUMemory(const GPUMemory<T> &other) : m_data{other.m_data}, m_size{other.m_size}, m_owned{false} {}
+    __host__ __device__ GPUMemory(const GPUMemory<T> &other) : m_data{other.m_data}, m_size{other.m_size}, m_device_index{other.m_device_index}, m_owned{false} {}
 
     void check_guards() const {
 #if DEBUG_GUARD_SIZE > 0
@@ -141,6 +144,8 @@ public:
         std::cout << "GPUMemory: Allocating " << bytes_to_string(n_bytes) << "." << std::endl;
 #endif
 
+        m_device_index = at::cuda::current_device();
+        c10::cuda::CUDAGuard device_guard(c10::Device(c10::kCUDA, m_device_index));
         uint8_t *rawptr = static_cast<uint8_t*>(torch_cuda_malloc(n_bytes+DEBUG_GUARD_SIZE*2));
 #if DEBUG_GUARD_SIZE > 0
         torch_cuda_memset(rawptr , 0xff, DEBUG_GUARD_SIZE);
@@ -158,11 +163,17 @@ public:
 
         uint8_t *rawptr = (uint8_t*)m_data;
         if (rawptr) rawptr-=DEBUG_GUARD_SIZE;
-        torch_cuda_free(rawptr);
+        if (m_device_index >= 0) {
+            c10::cuda::CUDAGuard device_guard(c10::Device(c10::kCUDA, m_device_index));
+            torch_cuda_free(rawptr);
+        } else {
+            torch_cuda_free(rawptr);
+        }
 
         total_n_bytes_allocated() -= get_bytes();
 
         m_data = nullptr;
+        m_device_index = -1;
     }
 
     /// Allocates memory for size items of type T
