@@ -11,6 +11,10 @@
 #include <thrust/gather.h>
 #include <thrust/for_each.h>
 #include <thrust/execution_policy.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <ATen/cuda/ThrustAllocator.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDACachingAllocator.h>
 // Added for memory-optimized pipeline
 #include <thrust/copy.h>
 #include <thrust/tuple.h>
@@ -23,7 +27,52 @@ using V3f = float3;
 // Triangle index structure
 struct Tri { int v0, v1, v2; };
 
-// Lookup tables (partial placeholder). 
+template <typename T>
+struct TorchDeviceAllocator {
+    using value_type = T;
+
+    int device_index;
+
+    TorchDeviceAllocator() : device_index(at::cuda::current_device()) {}
+    explicit TorchDeviceAllocator(int device_index) : device_index(device_index) {}
+
+    template <typename U>
+    TorchDeviceAllocator(const TorchDeviceAllocator<U>& other) noexcept : device_index(other.device_index) {}
+
+    template <typename U>
+    struct rebind {
+        using other = TorchDeviceAllocator<U>;
+    };
+
+    value_type* allocate(std::size_t n) {
+        if (n == 0) {return nullptr;}
+        c10::cuda::CUDAGuard device_guard(c10::Device(c10::kCUDA, device_index));
+        auto allocator = c10::cuda::CUDACachingAllocator::get();
+        return static_cast<value_type*>(allocator->raw_alloc(n * sizeof(value_type)));
+    }
+
+    void deallocate(value_type* p, std::size_t) {
+        if (p == nullptr) {return;}
+        c10::cuda::CUDAGuard device_guard(c10::Device(c10::kCUDA, device_index));
+        auto allocator = c10::cuda::CUDACachingAllocator::get();
+        allocator->raw_delete(p);
+    }
+};
+
+template <typename T, typename U>
+bool operator==(const TorchDeviceAllocator<T>& lhs, const TorchDeviceAllocator<U>& rhs) noexcept {
+    return lhs.device_index == rhs.device_index;
+}
+
+template <typename T, typename U>
+bool operator!=(const TorchDeviceAllocator<T>& lhs, const TorchDeviceAllocator<U>& rhs) noexcept {
+    return !(lhs == rhs);
+}
+
+template <typename T>
+using TorchDeviceVector = thrust::device_vector<T, TorchDeviceAllocator<T>>;
+
+// Lookup tables (partial placeholder).
 __device__ __constant__ int edgeTable[256] = {
     0x0  , 0x109, 0x203, 0x30a, 0x406, 0x50f, 0x605, 0x70c,
     0x80c, 0x905, 0xa0f, 0xb06, 0xc0a, 0xd03, 0xe09, 0xf00,
@@ -56,7 +105,7 @@ __device__ __constant__ int edgeTable[256] = {
     0xe90, 0xf99, 0xc93, 0xd9a, 0xa96, 0xb9f, 0x895, 0x99c,
     0x69c, 0x795, 0x49f, 0x596, 0x29a, 0x393, 0x99 , 0x190,
     0xf00, 0xe09, 0xd03, 0xc0a, 0xb06, 0xa0f, 0x905, 0x80c,
-    0x70c, 0x605, 0x50f, 0x406, 0x30a, 0x203, 0x109, 0x0   
+    0x70c, 0x605, 0x50f, 0x406, 0x30a, 0x203, 0x109, 0x0
 };
 
 __device__ __constant__ int triTable[256][16] = {
@@ -535,21 +584,21 @@ __global__ void collectCornerContributions(const int* coords, const float* corne
                                           int* corner_x, int* corner_y, int* corner_z, float* corner_vals, int* corner_counts) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= N * 8) return;
-    
+
     int voxel_id = tid / 8;
     int corner_id = tid % 8;
-    
+
     // Get voxel position
     int vx = coords[voxel_id * 3 + 0];
-    int vy = coords[voxel_id * 3 + 1]; 
+    int vy = coords[voxel_id * 3 + 1];
     int vz = coords[voxel_id * 3 + 2];
-    
+
     // Get corner position
     int3 offset = cornerOffset[corner_id];
     int cx = vx + offset.x;
     int cy = vy + offset.y;
     int cz = vz + offset.z;
-    
+
     // Store corner data
     corner_x[tid] = cx;
     corner_y[tid] = cy;
@@ -559,33 +608,33 @@ __global__ void collectCornerContributions(const int* coords, const float* corne
 }
 
 __global__ void updateCornerValues(const int* coords, float* corners, int N,
-                                 const int* unique_x, const int* unique_y, const int* unique_z, 
+                                 const int* unique_x, const int* unique_y, const int* unique_z,
                                  const float* avg_vals, int num_unique) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= N * 8) return;
-    
+
     int voxel_id = tid / 8;
     int corner_id = tid % 8;
-    
+
     // Get voxel position
     int vx = coords[voxel_id * 3 + 0];
-    int vy = coords[voxel_id * 3 + 1]; 
+    int vy = coords[voxel_id * 3 + 1];
     int vz = coords[voxel_id * 3 + 2];
-    
+
     // Get corner position
     int3 offset = cornerOffset[corner_id];
     int cx = vx + offset.x;
     int cy = vy + offset.y;
     int cz = vz + offset.z;
-    
+
     // Binary search for this corner coordinate
     int left = 0, right = num_unique - 1;
     while (left <= right) {
         int mid = (left + right) / 2;
         int mx = unique_x[mid];
-        int my = unique_y[mid]; 
+        int my = unique_y[mid];
         int mz = unique_z[mid];
-        
+
         if (cx < mx || (cx == mx && cy < my) || (cx == mx && cy == my && cz < mz)) {
             right = mid - 1;
         } else if (cx > mx || (cx == mx && cy > my) || (cx == mx && cy == my && cz > mz)) {
@@ -603,13 +652,13 @@ struct CornerData {
     int x, y, z;
     float value;
     int count;
-    
+
     __host__ __device__ bool operator<(const CornerData& other) const {
         if (x != other.x) return x < other.x;
         if (y != other.y) return y < other.y;
         return z < other.z;
     }
-    
+
     __host__ __device__ bool operator==(const CornerData& other) const {
         return x == other.x && y == other.y && z == other.z;
     }
@@ -629,37 +678,40 @@ struct CornerAverage {
 };
 
 // Host function: sparse marching cubes
-inline std::pair<thrust::device_vector<V3f>, thrust::device_vector<Tri>>
+inline std::pair<TorchDeviceVector<V3f>, TorchDeviceVector<Tri>>
 _sparse_marching_cubes(const int* d_coords, const float* d_corners, int N, float iso, bool ensure_consistency, cudaStream_t stream) {
+    at::cuda::ThrustAllocator thrust_allocator;
+    auto policy = thrust::cuda::par(thrust_allocator).on(stream);
+
     // Output containers
-    thrust::device_vector<V3f> vertices; 
-    thrust::device_vector<Tri> triangles;
+    TorchDeviceVector<V3f> vertices;
+    TorchDeviceVector<Tri> triangles;
     if (N <= 0) {
         // No voxels, return empty mesh
         return {vertices, triangles};
     }
 
     // Create a copy of corners data if we need to ensure consistency
-    thrust::device_vector<float> corners_copy;
+    TorchDeviceVector<float> corners_copy;
     const float* d_corners_to_use = d_corners;
-    
+
     if (ensure_consistency) {
         // Copy original corner data
         corners_copy.resize(N * 8);
-        thrust::copy(thrust::cuda::par.on(stream), 
-                     d_corners, d_corners + N * 8, 
+        thrust::copy(policy,
+                     d_corners, d_corners + N * 8,
                      corners_copy.begin());
-        
+
         // Total number of corner instances (8 per voxel)
         const int total_corners = N * 8;
-        
+
         // Create arrays to store corner data
-        thrust::device_vector<int> corner_x(total_corners);
-        thrust::device_vector<int> corner_y(total_corners);
-        thrust::device_vector<int> corner_z(total_corners);
-        thrust::device_vector<float> corner_vals(total_corners);
-        thrust::device_vector<int> corner_counts(total_corners);
-        
+        TorchDeviceVector<int> corner_x(total_corners);
+        TorchDeviceVector<int> corner_y(total_corners);
+        TorchDeviceVector<int> corner_z(total_corners);
+        TorchDeviceVector<float> corner_vals(total_corners);
+        TorchDeviceVector<int> corner_counts(total_corners);
+
         // Collect all corner contributions
         int threads_corner = 256;
         int blocks_corner = (total_corners + threads_corner - 1) / threads_corner;
@@ -670,10 +722,10 @@ _sparse_marching_cubes(const int* d_coords, const float* d_corners, int N, float
             thrust::raw_pointer_cast(corner_z.data()),
             thrust::raw_pointer_cast(corner_vals.data()),
             thrust::raw_pointer_cast(corner_counts.data()));
-        
+
         // Create corner data structure for sorting and averaging
-        thrust::device_vector<CornerData> corner_data(total_corners);
-        thrust::transform(thrust::cuda::par.on(stream),
+        TorchDeviceVector<CornerData> corner_data(total_corners);
+        thrust::transform(policy,
                           thrust::counting_iterator<int>(0),
                           thrust::counting_iterator<int>(total_corners),
                           corner_data.begin(),
@@ -690,16 +742,16 @@ _sparse_marching_cubes(const int* d_coords, const float* d_corners, int N, float
                               data.count = corner_counts_ptr[i];
                               return data;
                           });
-        
+
         // Sort by corner coordinates
-        thrust::sort(thrust::cuda::par.on(stream), corner_data.begin(), corner_data.end());
-        
+        thrust::sort(policy, corner_data.begin(), corner_data.end());
+
         // Reduce by key to get average for each unique corner
-        thrust::device_vector<CornerData> unique_corners(total_corners);
-        thrust::device_vector<CornerData> corner_sums(total_corners);
-        
+        TorchDeviceVector<CornerData> unique_corners(total_corners);
+        TorchDeviceVector<CornerData> corner_sums(total_corners);
+
         auto new_end = thrust::reduce_by_key(
-            thrust::cuda::par.on(stream),
+            policy,
             corner_data.begin(), corner_data.end(),
             corner_data.begin(),
             unique_corners.begin(),
@@ -708,18 +760,18 @@ _sparse_marching_cubes(const int* d_coords, const float* d_corners, int N, float
                 return a.x == b.x && a.y == b.y && a.z == b.z;
             },
             CornerAverage());
-        
+
         int num_unique = new_end.first - unique_corners.begin();
         unique_corners.resize(num_unique);
         corner_sums.resize(num_unique);
-        
+
         // Compute averages and create coordinate arrays
-        thrust::device_vector<int> unique_x(num_unique);
-        thrust::device_vector<int> unique_y(num_unique);
-        thrust::device_vector<int> unique_z(num_unique);
-        thrust::device_vector<float> avg_vals(num_unique);
-        
-        thrust::transform(thrust::cuda::par.on(stream),
+        TorchDeviceVector<int> unique_x(num_unique);
+        TorchDeviceVector<int> unique_y(num_unique);
+        TorchDeviceVector<int> unique_z(num_unique);
+        TorchDeviceVector<float> avg_vals(num_unique);
+
+        thrust::transform(policy,
                           thrust::counting_iterator<int>(0),
                           thrust::counting_iterator<int>(num_unique),
                           thrust::make_zip_iterator(thrust::make_tuple(
@@ -731,7 +783,7 @@ _sparse_marching_cubes(const int* d_coords, const float* d_corners, int N, float
                               float avg = sum.value / sum.count;
                               return thrust::make_tuple(corner.x, corner.y, corner.z, avg);
                           });
-        
+
         // Update corner values using the simpler kernel
         updateCornerValues<<<blocks_corner, threads_corner, 0, stream>>>(
             d_coords,
@@ -742,13 +794,13 @@ _sparse_marching_cubes(const int* d_coords, const float* d_corners, int N, float
             thrust::raw_pointer_cast(unique_z.data()),
             thrust::raw_pointer_cast(avg_vals.data()),
             num_unique);
-        
+
         d_corners_to_use = thrust::raw_pointer_cast(corners_copy.data());
     }
 
     // Temporary arrays for counts and prefix sums
-    thrust::device_vector<int> vertCount(N);
-    thrust::device_vector<int> triCount(N);
+    TorchDeviceVector<int> vertCount(N);
+    TorchDeviceVector<int> triCount(N);
 
     int threads = 256;
     int blocks = (N + threads - 1) / threads;
@@ -756,11 +808,11 @@ _sparse_marching_cubes(const int* d_coords, const float* d_corners, int N, float
                                                   thrust::raw_pointer_cast(vertCount.data()),
                                                   thrust::raw_pointer_cast(triCount.data()));
 
-    thrust::device_vector<int> prefixVert(N);
-    thrust::device_vector<int> prefixTri(N);
-    thrust::exclusive_scan(thrust::cuda::par.on(stream),
+    TorchDeviceVector<int> prefixVert(N);
+    TorchDeviceVector<int> prefixTri(N);
+    thrust::exclusive_scan(policy,
                            vertCount.begin(), vertCount.end(), prefixVert.begin());
-    thrust::exclusive_scan(thrust::cuda::par.on(stream),
+    thrust::exclusive_scan(policy,
                            triCount.begin(), triCount.end(), prefixTri.begin());
 
     // Compute totals on the caller stream. device_vector::back() performs a
@@ -786,12 +838,12 @@ _sparse_marching_cubes(const int* d_coords, const float* d_corners, int N, float
     }
 
     // Free counts early to lower peak memory
-    thrust::device_vector<int>().swap(vertCount);
-    thrust::device_vector<int>().swap(triCount);
+    TorchDeviceVector<int>().swap(vertCount);
+    TorchDeviceVector<int>().swap(triCount);
 
     // Allocate space for all intersection vertices (M) and their keys
-    thrust::device_vector<EdgeKey> keys(M);
-    thrust::device_vector<V3f>    verts(M);
+    TorchDeviceVector<EdgeKey> keys(M);
+    TorchDeviceVector<V3f>    verts(M);
 
     // Generate vertices in parallel
     blocks = (N + threads - 1) / threads;
@@ -802,13 +854,13 @@ _sparse_marching_cubes(const int* d_coords, const float* d_corners, int N, float
                                                     thrust::raw_pointer_cast(verts.data()));
 
     // Create index array [0, 1, ..., M-1] to track original positions
-    thrust::device_vector<int> indices(M);
+    TorchDeviceVector<int> indices(M);
     if (M > 0) {
-        thrust::sequence(thrust::cuda::par.on(stream), indices.begin(), indices.end());
+        thrust::sequence(policy, indices.begin(), indices.end());
 
         // Sort by key and reorder verts and indices in one pass (no extra vertsSorted buffer)
         auto zipped_vals = thrust::make_zip_iterator(thrust::make_tuple(verts.begin(), indices.begin()));
-        thrust::sort_by_key(thrust::cuda::par.on(stream), keys.begin(), keys.end(), zipped_vals);
+        thrust::sort_by_key(policy, keys.begin(), keys.end(), zipped_vals);
 
         // Build head flags using a transform iterator functor
         EdgeKey* d_keys = thrust::raw_pointer_cast(keys.data());
@@ -816,8 +868,8 @@ _sparse_marching_cubes(const int* d_coords, const float* d_corners, int N, float
         auto head_flags = thrust::make_transform_iterator(count_begin, HeadFlagFunctor{d_keys});
 
         // Compute inclusive scan of head flags directly into group ids (1-based)
-        thrust::device_vector<int> mapSortedToUnique(M);
-        thrust::inclusive_scan(thrust::cuda::par.on(stream), head_flags, head_flags + M, mapSortedToUnique.begin());
+        TorchDeviceVector<int> mapSortedToUnique(M);
+        thrust::inclusive_scan(policy, head_flags, head_flags + M, mapSortedToUnique.begin());
 
         // Number of unique vertices
         int uniqueCount = 0;
@@ -827,29 +879,29 @@ _sparse_marching_cubes(const int* d_coords, const float* d_corners, int N, float
         vertices.resize(uniqueCount);
 
         // Emit unique vertices by copying only the heads
-        thrust::copy_if(thrust::cuda::par.on(stream),
+        thrust::copy_if(policy,
                         verts.begin(), verts.end(),
                         head_flags,
                         vertices.begin(),
                         IsNonZero());
 
         // Build mapping from original vertex index -> new unique index
-        thrust::device_vector<int> mapOrigToNew(M);
+        TorchDeviceVector<int> mapOrigToNew(M);
         // Convert to 0-based ids in-place and scatter back to original order
-        thrust::transform(thrust::cuda::par.on(stream),
+        thrust::transform(policy,
                           mapSortedToUnique.begin(), mapSortedToUnique.end(),
                           mapSortedToUnique.begin(),
                           MinusOne());
-        thrust::scatter(thrust::cuda::par.on(stream),
+        thrust::scatter(policy,
                         mapSortedToUnique.begin(), mapSortedToUnique.end(),
                         indices.begin(),
                         mapOrigToNew.begin());
 
         // Free temporaries no longer needed before allocating triangles
-        thrust::device_vector<EdgeKey>().swap(keys);
-        thrust::device_vector<V3f>().swap(verts);
-        thrust::device_vector<int>().swap(indices);
-        thrust::device_vector<int>().swap(mapSortedToUnique);
+        TorchDeviceVector<EdgeKey>().swap(keys);
+        TorchDeviceVector<V3f>().swap(verts);
+        TorchDeviceVector<int>().swap(indices);
+        TorchDeviceVector<int>().swap(mapSortedToUnique);
 
         // Generate triangles (old indices)
         triangles.resize(T);
@@ -862,7 +914,7 @@ _sparse_marching_cubes(const int* d_coords, const float* d_corners, int N, float
         // Remap triangle vertex indices to the new deduplicated indices
         if (T > 0) {
             int* d_map = thrust::raw_pointer_cast(mapOrigToNew.data());
-            thrust::for_each(thrust::cuda::par.on(stream),
+            thrust::for_each(policy,
                              triangles.begin(), triangles.end(),
                              RemapTri{d_map});
         }

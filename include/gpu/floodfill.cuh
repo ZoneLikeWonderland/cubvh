@@ -1,5 +1,8 @@
 #include <cuda.h>  
 #include <cuda_runtime.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDACachingAllocator.h>
 
 #include <cstdint>
@@ -148,6 +151,7 @@ __global__ void compress(int * __restrict__ labels, int Ntot)
 static int divUp(int a, int b) { return (a + b - 1) / b; }
 
 static void* torchCudaMalloc(size_t bytes) {
+    c10::cuda::CUDAGuard device_guard(c10::Device(c10::kCUDA, at::cuda::current_device()));
     auto allocator = c10::cuda::CUDACachingAllocator::get();
     return allocator->raw_alloc(bytes);
 }
@@ -156,6 +160,9 @@ static void torchCudaFree(void* ptr) {
     if (ptr == nullptr) {
         return;
     }
+    cudaPointerAttributes attributes;
+    C10_CUDA_CHECK(cudaPointerGetAttributes(&attributes, ptr));
+    c10::cuda::CUDAGuard device_guard(c10::Device(c10::kCUDA, attributes.device));
     auto allocator = c10::cuda::CUDACachingAllocator::get();
     allocator->raw_delete(ptr);
 }

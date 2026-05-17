@@ -9,10 +9,17 @@ _sdf_mode_to_id = {
     'raystab': 1,
 }
 
-def _cuda_device(*tensors):
+def _cuda_device(*tensors, device=None):
     devices = [tensor.device for tensor in tensors if torch.is_tensor(tensor) and tensor.is_cuda]
     assert all(device == devices[0] for device in devices), "CUDA tensors must be on the same device"
-    return devices[0] if devices else torch.device("cuda", torch.cuda.current_device())
+    if device is not None:
+        device = torch.device(device)
+        assert device.type == "cuda" and device.index is not None, device
+        if devices:
+            assert devices[0] == device, f"CUDA tensors must be on {device}, got {devices[0]}"
+        return device
+    assert devices, "CPU-only CUDA operation requires an explicit CUDA device"
+    return devices[0]
 
 def _to_device(tensor, device, dtype):
     assert torch.is_tensor(tensor)
@@ -22,11 +29,11 @@ def _to_device(tensor, device, dtype):
     return tensor.to(dtype=dtype).contiguous()
 
 class cuBVH():
-    def __init__(self, vertices, triangles):
+    def __init__(self, vertices, triangles, device=None):
         # vertices: np.ndarray, [N, 3]
         # triangles: np.ndarray, [M, 3]
 
-        self.device = _cuda_device(vertices, triangles)
+        self.device = _cuda_device(vertices, triangles, device=device)
 
         if torch.is_tensor(vertices): vertices = vertices.cpu().numpy()
         if torch.is_tensor(triangles): triangles = triangles.cpu().numpy()
@@ -36,7 +43,7 @@ class cuBVH():
         
         # implementation
         with torch.cuda.device(self.device):
-            self.impl = _backend.create_cuBVH(vertices, triangles)
+            self.impl = _backend.create_cuBVH(vertices, triangles, self.device.index)
 
     def ray_trace(self, rays_o, rays_d):
         # rays_o: torch.Tensor, float, [N, 3]
@@ -124,11 +131,11 @@ class cuBVH():
 
         return distances, face_id, uvw
 
-def floodfill(grid):
+def floodfill(grid, device=None):
     # grid: torch.Tensor, uint8, [B, H, W, D] or [H, W, D]
     # return: torch.Tensor, int32, [B, H, W, D] or [H, W, D], label of the connected component (value can be 0 to H*W*D-1, not remapped!)
 
-    device = _cuda_device(grid)
+    device = _cuda_device(grid, device=device)
     if not grid.is_cuda:
         grid = grid.to(device)
     grid = grid.contiguous()

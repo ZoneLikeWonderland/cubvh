@@ -26,7 +26,7 @@ public:
 };
 
 // function to create an implementation of cuBVH
-cuBVH* create_cuBVH(Ref<const Verts> vertices, Ref<const Trigs> triangles);
+cuBVH* create_cuBVH(Ref<const Verts> vertices, Ref<const Trigs> triangles, int device_index);
 // floodfill
 at::Tensor floodfill(at::Tensor grid);
 

@@ -22,8 +22,9 @@ class cuBVHImpl : public cuBVH {
 public:
 
     // accept numpy array (cpu) to init 
-    cuBVHImpl(Ref<const Verts> vertices, Ref<const Trigs> triangles) : cuBVH() {
-        device_index = at::cuda::current_device();
+    cuBVHImpl(Ref<const Verts> vertices, Ref<const Trigs> triangles, int device) : cuBVH() {
+        TORCH_CHECK(device >= 0, "cuBVH device index must be non-negative");
+        device_index = device;
         c10::cuda::CUDAGuard device_guard(c10::Device(c10::kCUDA, device_index));
 
         const size_t n_vertices = vertices.rows();
@@ -98,8 +99,8 @@ public:
     int device_index = -1;
 };
     
-cuBVH* create_cuBVH(Ref<const Verts> vertices, Ref<const Trigs> triangles) {
-    return new cuBVHImpl{vertices, triangles};
+cuBVH* create_cuBVH(Ref<const Verts> vertices, Ref<const Trigs> triangles, int device_index) {
+    return new cuBVHImpl{vertices, triangles, device_index};
 }
 
 at::Tensor floodfill(at::Tensor grid) {
@@ -156,8 +157,8 @@ std::tuple<at::Tensor, at::Tensor> sparse_marching_cubes(
 
     // --- call the CUDA sparse MC core (header we wrote earlier) -------------------
     auto mesh = _sparse_marching_cubes(d_coords, d_corners, N, iso, ensure_consistency, stream);
-    thrust::device_vector<V3f> &verts_vec = mesh.first;
-    thrust::device_vector<Tri> &tris_vec  = mesh.second;
+    auto& verts_vec = mesh.first;
+    auto& tris_vec  = mesh.second;
     const int64_t M = static_cast<int64_t>(verts_vec.size());
     const int64_t T = static_cast<int64_t>(tris_vec.size());
 
@@ -201,13 +202,13 @@ public:
     }
 
     void resize(int capacity) override {
-        remember_current_device();
+        TORCH_CHECK(device_index >= 0, "cuHashTable device is not initialized; call insert/build with CUDA coords before resize");
         c10::cuda::CUDAGuard device_guard{c10::Device(c10::kCUDA, device_index)};
         ht.resize(capacity);
     }
 
     void prepare() override {
-        remember_current_device();
+        TORCH_CHECK(device_index >= 0, "cuHashTable device is not initialized; call insert/build with CUDA coords before prepare");
         c10::cuda::CUDAGuard device_guard{c10::Device(c10::kCUDA, device_index)};
         cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
         ht.prepare(stream);
@@ -261,13 +262,6 @@ public:
 private:
     void remember_device(const at::Tensor& tensor) {
         const int next_device = tensor.get_device();
-        TORCH_CHECK(device_index < 0 || device_index == next_device,
-                    "cuHashTable only supports one CUDA device per instance");
-        device_index = next_device;
-    }
-
-    void remember_current_device() {
-        const int next_device = at::cuda::current_device();
         TORCH_CHECK(device_index < 0 || device_index == next_device,
                     "cuHashTable only supports one CUDA device per instance");
         device_index = next_device;
