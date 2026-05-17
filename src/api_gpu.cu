@@ -5,6 +5,9 @@
 #include <gpu/spcumc.cuh>
 #include <gpu/hashtable.cuh>
 
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
+
 #include <Eigen/Dense>
 
 using namespace Eigen;
@@ -45,16 +48,27 @@ public:
 
     void ray_trace(at::Tensor rays_o, at::Tensor rays_d, at::Tensor positions, at::Tensor face_id, at::Tensor depth) {
 
+        assert(rays_o.is_cuda());
+        assert(rays_d.device() == rays_o.device());
+        assert(positions.device() == rays_o.device());
+        assert(face_id.device() == rays_o.device());
+        assert(depth.device() == rays_o.device());
+        c10::cuda::CUDAGuard device_guard{rays_o.device()};
         const uint32_t n_elements = rays_o.size(0);
-        cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+        cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
         triangle_bvh->ray_trace_gpu(n_elements, rays_o.data_ptr<float>(), rays_d.data_ptr<float>(), positions.data_ptr<float>(), face_id.data_ptr<int64_t>(), depth.data_ptr<float>(), triangles_gpu.data(), stream);
     }
 
     void unsigned_distance(at::Tensor positions, at::Tensor distances, at::Tensor face_id, at::optional<at::Tensor> uvw) {
 
+        assert(positions.is_cuda());
+        assert(distances.device() == positions.device());
+        assert(face_id.device() == positions.device());
+        assert(!uvw.has_value() || uvw.value().device() == positions.device());
+        c10::cuda::CUDAGuard device_guard{positions.device()};
         const uint32_t n_elements = positions.size(0);
-        cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+        cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
         triangle_bvh->unsigned_distance_gpu(n_elements, positions.data_ptr<float>(), distances.data_ptr<float>(), face_id.data_ptr<int64_t>(), uvw.has_value() ? uvw.value().data_ptr<float>() : nullptr, triangles_gpu.data(), stream);
 
@@ -62,8 +76,13 @@ public:
 
     void signed_distance(at::Tensor positions, at::Tensor distances, at::Tensor face_id, at::optional<at::Tensor> uvw, uint32_t mode) {
 
+        assert(positions.is_cuda());
+        assert(distances.device() == positions.device());
+        assert(face_id.device() == positions.device());
+        assert(!uvw.has_value() || uvw.value().device() == positions.device());
+        c10::cuda::CUDAGuard device_guard{positions.device()};
         const uint32_t n_elements = positions.size(0);
-        cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+        cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
         triangle_bvh->signed_distance_gpu(n_elements, mode, positions.data_ptr<float>(), distances.data_ptr<float>(), face_id.data_ptr<int64_t>(), uvw.has_value() ? uvw.value().data_ptr<float>() : nullptr, triangles_gpu.data(), stream);
     }
@@ -80,7 +99,9 @@ cuBVH* create_cuBVH(Ref<const Verts> vertices, Ref<const Trigs> triangles) {
 at::Tensor floodfill(at::Tensor grid) {
 
     // assert grid is uint8_t
+    assert(grid.is_cuda());
     assert(grid.dtype() == at::ScalarType::Bool);
+    c10::cuda::CUDAGuard device_guard{grid.device()};
 
     const int B = grid.size(0);
     const int H = grid.size(1);
@@ -89,8 +110,9 @@ at::Tensor floodfill(at::Tensor grid) {
 
     // allocate mask
     at::Tensor mask = at::zeros({B, H, W, D}, at::device(grid.device()).dtype(at::ScalarType::Int));
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
-    _floodfill_batch(grid.data_ptr<bool>(), B, H, W, D, mask.data_ptr<int32_t>());
+    _floodfill_batch(grid.data_ptr<bool>(), B, H, W, D, mask.data_ptr<int32_t>(), stream);
 
     return mask;
 }
@@ -111,6 +133,7 @@ std::tuple<at::Tensor, at::Tensor> sparse_marching_cubes(
                 "corners must be of shape [N,8]");
     TORCH_CHECK(coords.size(0) == corners.size(0),
                 "coords and corners must have the same first-dim (N)");
+    c10::cuda::CUDAGuard device_guard{coords.device()};
 
     // Ensure contiguous memory - PyTorch extensions expect this.
     coords  = coords.contiguous();

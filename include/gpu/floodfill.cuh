@@ -158,7 +158,8 @@ extern "C"
 void _floodfill_batch(  
         const bool *grid,  
         int B, int H, int W, int D,  
-        int32_t *mask)  
+        int32_t *mask,
+        cudaStream_t stream)
 {  
     const int Nvol = H * W * D;          // size of one volume  
     const int Ntot = B * Nvol;           // size of entire batch
@@ -175,13 +176,13 @@ void _floodfill_batch(
     cudaMalloc(&d_labels,  bytesLabel);  
     cudaMalloc(&d_changed, sizeof(int));
 
-    cudaMemcpy(d_grid, grid, bytesGrid, cudaMemcpyHostToDevice);
+    cudaMemcpyAsync(d_grid, grid, bytesGrid, cudaMemcpyDeviceToDevice, stream);
 
     /* --------------------------- init ------------------------------------ */  
     {  
         int blocks = divUp(Ntot, THREADS_PER_BLOCK);  
-        initLabels<<<blocks, THREADS_PER_BLOCK>>>(d_grid, d_labels, Ntot);  
-        cudaDeviceSynchronize();
+        initLabels<<<blocks, THREADS_PER_BLOCK, 0, stream>>>(d_grid, d_labels, Ntot);
+        cudaStreamSynchronize(stream);
         
         // Check for kernel launch errors
         cudaError_t err = cudaGetLastError();
@@ -205,12 +206,12 @@ void _floodfill_batch(
     int no_change_count = 0;  // Track consecutive iterations with no changes
     
     while (h_changed && iteration < MAX_ITERATIONS) {  
-        cudaMemset(d_changed, 0, sizeof(int));
+        cudaMemsetAsync(d_changed, 0, sizeof(int), stream);
 
         /* hook */  
         {  
             int blocks = divUp(Ntot, THREADS_PER_BLOCK);  
-            hookBatch<<<blocks, THREADS_PER_BLOCK>>>(  
+            hookBatch<<<blocks, THREADS_PER_BLOCK, 0, stream>>>(
                 d_grid, d_labels, d_changed,  
                 H, W, D, Nvol, Ntot);  
         }
@@ -218,10 +219,10 @@ void _floodfill_batch(
         /* compress - only run every few iterations to reduce overhead */  
         if (iteration % 5 == 4 || iteration < 10) {  // Compress more frequently early on
             int blocks = divUp(Ntot, THREADS_PER_BLOCK);  
-            compress<<<blocks, THREADS_PER_BLOCK>>>(d_labels, Ntot);  
+            compress<<<blocks, THREADS_PER_BLOCK, 0, stream>>>(d_labels, Ntot);
         }
 
-        cudaDeviceSynchronize();
+        cudaStreamSynchronize(stream);
         
         // Check for kernel errors
         cudaError_t err = cudaGetLastError();
@@ -230,7 +231,8 @@ void _floodfill_batch(
             break;
         }
         
-        cudaMemcpy(&h_changed, d_changed, sizeof(int), cudaMemcpyDeviceToHost);
+        cudaMemcpyAsync(&h_changed, d_changed, sizeof(int), cudaMemcpyDeviceToHost, stream);
+        cudaStreamSynchronize(stream);
         iteration++;
         
         // Early termination: if no changes for several iterations, we've likely converged
@@ -258,12 +260,13 @@ void _floodfill_batch(
     /* final flatten */  
     {  
         int blocks = divUp(Ntot, THREADS_PER_BLOCK);  
-        compress<<<blocks, THREADS_PER_BLOCK>>>(d_labels, Ntot);  
-        cudaDeviceSynchronize();  
+        compress<<<blocks, THREADS_PER_BLOCK, 0, stream>>>(d_labels, Ntot);
+        cudaStreamSynchronize(stream);
     }
 
     /* copy back */  
-    cudaMemcpy(mask, d_labels, bytesLabel, cudaMemcpyDeviceToHost);
+    cudaMemcpyAsync(mask, d_labels, bytesLabel, cudaMemcpyDeviceToDevice, stream);
+    cudaStreamSynchronize(stream);
 
     /* cleanup */  
     cudaFree(d_grid);  

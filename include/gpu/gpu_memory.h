@@ -32,6 +32,7 @@
 #pragma once
 
 #include <gpu/common.h>
+#include <ATen/cuda/CUDAContext.h>
 #include <atomic>
 #include <stdexcept>
 #include <stdint.h>
@@ -55,6 +56,22 @@ namespace cubvh {
 inline std::atomic<size_t>& total_n_bytes_allocated() {
     static std::atomic<size_t> s_total_n_bytes_allocated{0};
     return s_total_n_bytes_allocated;
+}
+
+inline cudaStream_t torch_cuda_stream() {
+    return at::cuda::getCurrentCUDAStream().stream();
+}
+
+inline void torch_cuda_memcpy(void* dst, const void* src, size_t bytes, cudaMemcpyKind kind) {
+    cudaStream_t stream = torch_cuda_stream();
+    CUDA_CHECK_THROW(cudaMemcpyAsync(dst, src, bytes, kind, stream));
+    if (kind != cudaMemcpyDeviceToDevice) {
+        CUDA_CHECK_THROW(cudaStreamSynchronize(stream));
+    }
+}
+
+inline void torch_cuda_memset(void* dst, int value, size_t bytes) {
+    CUDA_CHECK_THROW(cudaMemsetAsync(dst, value, bytes, torch_cuda_stream()));
 }
 
 /// Managed memory on the Device
@@ -86,12 +103,12 @@ public:
             return;
         uint8_t buf[DEBUG_GUARD_SIZE];
         const uint8_t *rawptr=(const uint8_t *)m_data;
-        cudaMemcpy(buf, rawptr-DEBUG_GUARD_SIZE, DEBUG_GUARD_SIZE, cudaMemcpyDeviceToHost);
+        torch_cuda_memcpy(buf, rawptr-DEBUG_GUARD_SIZE, DEBUG_GUARD_SIZE, cudaMemcpyDeviceToHost);
         for (int i=0;i<DEBUG_GUARD_SIZE;++i) if (buf[i] != 0xff) {
             printf("TRASH BEFORE BLOCK offset %d data %p, read 0x%02x expected 0xff!\n", i, m_data, buf[i] );
             break;
         }
-        cudaMemcpy(buf, rawptr+m_size*sizeof(T), DEBUG_GUARD_SIZE, cudaMemcpyDeviceToHost);
+        torch_cuda_memcpy(buf, rawptr+m_size*sizeof(T), DEBUG_GUARD_SIZE, cudaMemcpyDeviceToHost);
         for (int i=0;i<DEBUG_GUARD_SIZE;++i) if (buf[i] != 0xfe) {
             printf("TRASH AFTER BLOCK offset %d data %p, read 0x%02x expected 0xfe!\n", i, m_data, buf[i] );
             break;
@@ -111,8 +128,8 @@ public:
         uint8_t *rawptr = nullptr;
         CUDA_CHECK_THROW(cudaMalloc(&rawptr, n_bytes+DEBUG_GUARD_SIZE*2));
 #if DEBUG_GUARD_SIZE > 0
-        CUDA_CHECK_THROW(cudaMemset(rawptr , 0xff, DEBUG_GUARD_SIZE));
-        CUDA_CHECK_THROW(cudaMemset(rawptr+n_bytes+DEBUG_GUARD_SIZE , 0xfe, DEBUG_GUARD_SIZE));
+        torch_cuda_memset(rawptr , 0xff, DEBUG_GUARD_SIZE);
+        torch_cuda_memset(rawptr+n_bytes+DEBUG_GUARD_SIZE , 0xfe, DEBUG_GUARD_SIZE);
 #endif
         if (rawptr) rawptr+=DEBUG_GUARD_SIZE;
         m_data=(T*)(rawptr);
@@ -207,7 +224,7 @@ public:
         }
 
         try {
-            CUDA_CHECK_THROW(cudaMemset(m_data + offset, value, num_elements * sizeof(T)));
+            torch_cuda_memset(m_data + offset, value, num_elements * sizeof(T));
         } catch (std::runtime_error error) {
             throw std::runtime_error(std::string("Could not set memory: ") + error.what());
         }
@@ -225,7 +242,7 @@ public:
     /// Copy data of num_elements from the raw pointer on the host
     void copy_from_host(const T* host_data, const size_t num_elements) {
         try {
-            CUDA_CHECK_THROW(cudaMemcpy(data(), host_data, num_elements * sizeof(T), cudaMemcpyHostToDevice));
+            torch_cuda_memcpy(data(), host_data, num_elements * sizeof(T), cudaMemcpyHostToDevice);
         } catch (std::runtime_error error) {
             throw std::runtime_error(std::string("Could not copy from host: ") + error.what());
         }
@@ -290,7 +307,7 @@ public:
             throw std::runtime_error(std::string("Trying to copy ") + std::to_string(num_elements) + std::string(" elements, but vector size is only ") + std::to_string(m_size));
         }
         try {
-            CUDA_CHECK_THROW(cudaMemcpy(host_data, data(), num_elements * sizeof(T), cudaMemcpyDeviceToHost));
+            torch_cuda_memcpy(host_data, data(), num_elements * sizeof(T), cudaMemcpyDeviceToHost);
         } catch (std::runtime_error error) {
             throw std::runtime_error(std::string("Could not copy to host: ") + error.what());
         }
@@ -324,7 +341,7 @@ public:
         }
 
         try {
-            CUDA_CHECK_THROW(cudaMemcpy(m_data, other.m_data, m_size * sizeof(T), cudaMemcpyDeviceToDevice));
+            torch_cuda_memcpy(m_data, other.m_data, m_size * sizeof(T), cudaMemcpyDeviceToDevice);
         } catch (std::runtime_error error) {
             throw std::runtime_error(std::string("Could not copy from device: ") + error.what());
         }
@@ -337,7 +354,7 @@ public:
         }
 
         try {
-            CUDA_CHECK_THROW(cudaMemcpy(m_data, other.m_data, size * sizeof(T), cudaMemcpyDeviceToDevice));
+            torch_cuda_memcpy(m_data, other.m_data, size * sizeof(T), cudaMemcpyDeviceToDevice);
         } catch (std::runtime_error error) {
             throw std::runtime_error(std::string("Could not copy from device: ") + error.what());
         }
