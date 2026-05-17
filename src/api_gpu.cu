@@ -133,6 +133,8 @@ std::tuple<at::Tensor, at::Tensor> sparse_marching_cubes(
                 "corners must be of shape [N,8]");
     TORCH_CHECK(coords.size(0) == corners.size(0),
                 "coords and corners must have the same first-dim (N)");
+    TORCH_CHECK(corners.device() == coords.device(),
+                "coords and corners must be on the same CUDA device");
     c10::cuda::CUDAGuard device_guard{coords.device()};
 
     // Ensure contiguous memory - PyTorch extensions expect this.
@@ -193,11 +195,15 @@ public:
     }
 
     void resize(int capacity) override {
+        remember_current_device();
+        c10::cuda::CUDAGuard device_guard{c10::Device(c10::kCUDA, device_index)};
         ht.resize(capacity);
     }
 
     void prepare() override {
-        cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+        remember_current_device();
+        c10::cuda::CUDAGuard device_guard{c10::Device(c10::kCUDA, device_index)};
+        cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
         ht.prepare(stream);
     }
 
@@ -205,24 +211,28 @@ public:
         TORCH_CHECK(coords.is_cuda(),  "coords must reside on CUDA");
         TORCH_CHECK(coords.dtype()  == at::kInt,   "coords must be int32");
         TORCH_CHECK(coords.dim() == 2, "coords must be 2D [N,D]");
-        coords = coords.contiguous();
-        const int N = (int)coords.size(0);
-        const int D = (int)coords.size(1);
+        remember_device(coords);
+        c10::cuda::CUDAGuard device_guard{coords.device()};
+        coords_storage = coords.contiguous();
+        const int N = (int)coords_storage.size(0);
+        const int D = (int)coords_storage.size(1);
         ht.set_num_dims(D);
-        cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-        ht.insert(coords.data_ptr<int>(), N, stream);
+        cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+        ht.insert(coords_storage.data_ptr<int>(), N, stream);
     }
 
     void build(at::Tensor coords) override {
         TORCH_CHECK(coords.is_cuda(),  "coords must reside on CUDA");
         TORCH_CHECK(coords.dtype()  == at::kInt,   "coords must be int32");
         TORCH_CHECK(coords.dim() == 2, "coords must be 2D [N,D]");
-        coords = coords.contiguous();
-        const int N = (int)coords.size(0);
-        const int D = (int)coords.size(1);
+        remember_device(coords);
+        c10::cuda::CUDAGuard device_guard{coords.device()};
+        coords_storage = coords.contiguous();
+        const int N = (int)coords_storage.size(0);
+        const int D = (int)coords_storage.size(1);
         ht.set_num_dims(D);
-        cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-        ht.build(coords.data_ptr<int>(), N, stream);
+        cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+        ht.build(coords_storage.data_ptr<int>(), N, stream);
     }
 
     at::Tensor search(at::Tensor queries) const override {
@@ -230,17 +240,36 @@ public:
         TORCH_CHECK(queries.dtype()  == at::kInt,   "queries must be int32");
         TORCH_CHECK(queries.dim() == 2, "queries must be 2D [M,D]");
         TORCH_CHECK(ht.capacity > 0, "hash table is not built");
+        TORCH_CHECK(device_index == queries.get_device(),
+                    "queries must be on the same CUDA device as the hash table");
+        c10::cuda::CUDAGuard device_guard{queries.device()};
         at::Tensor q = queries.contiguous();
         const int M = (int)q.size(0);
         auto opts_i = torch::TensorOptions().dtype(torch::kInt32).device(q.device());
         at::Tensor out = at::empty({M}, opts_i);
-        cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+        cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
         ht.search(q.data_ptr<int>(), M, out.data_ptr<int>(), stream);
         return out;
     }
 
 private:
+    void remember_device(const at::Tensor& tensor) {
+        const int next_device = tensor.get_device();
+        TORCH_CHECK(device_index < 0 || device_index == next_device,
+                    "cuHashTable only supports one CUDA device per instance");
+        device_index = next_device;
+    }
+
+    void remember_current_device() {
+        const int next_device = at::cuda::current_device();
+        TORCH_CHECK(device_index < 0 || device_index == next_device,
+                    "cuHashTable only supports one CUDA device per instance");
+        device_index = next_device;
+    }
+
     HashTableInt ht;
+    at::Tensor coords_storage;
+    int device_index = -1;
 };
 
 cuHashTable* create_cuHashTable() {

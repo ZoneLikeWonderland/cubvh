@@ -33,6 +33,9 @@
 
 #include <gpu/common.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <ATen/cuda/ThrustAllocator.h>
+#include <torch/extension.h>
+#include <torch/torch.h>
 #include <atomic>
 #include <stdexcept>
 #include <stdint.h>
@@ -72,6 +75,19 @@ inline void torch_cuda_memcpy(void* dst, const void* src, size_t bytes, cudaMemc
 
 inline void torch_cuda_memset(void* dst, int value, size_t bytes) {
     CUDA_CHECK_THROW(cudaMemsetAsync(dst, value, bytes, torch_cuda_stream()));
+}
+
+inline void* torch_cuda_malloc(size_t bytes) {
+    auto allocator = c10::cuda::CUDACachingAllocator::get();
+    return allocator->raw_alloc(bytes);
+}
+
+inline void torch_cuda_free(void* ptr) {
+    if (ptr == nullptr) {
+        return;
+    }
+    auto allocator = c10::cuda::CUDACachingAllocator::get();
+    allocator->raw_delete(ptr);
 }
 
 /// Managed memory on the Device
@@ -125,8 +141,7 @@ public:
         std::cout << "GPUMemory: Allocating " << bytes_to_string(n_bytes) << "." << std::endl;
 #endif
 
-        uint8_t *rawptr = nullptr;
-        CUDA_CHECK_THROW(cudaMalloc(&rawptr, n_bytes+DEBUG_GUARD_SIZE*2));
+        uint8_t *rawptr = static_cast<uint8_t*>(torch_cuda_malloc(n_bytes+DEBUG_GUARD_SIZE*2));
 #if DEBUG_GUARD_SIZE > 0
         torch_cuda_memset(rawptr , 0xff, DEBUG_GUARD_SIZE);
         torch_cuda_memset(rawptr+n_bytes+DEBUG_GUARD_SIZE , 0xfe, DEBUG_GUARD_SIZE);
@@ -143,7 +158,7 @@ public:
 
         uint8_t *rawptr = (uint8_t*)m_data;
         if (rawptr) rawptr-=DEBUG_GUARD_SIZE;
-        CUDA_CHECK_THROW(cudaFree(rawptr));
+        torch_cuda_free(rawptr);
 
         total_n_bytes_allocated() -= get_bytes();
 

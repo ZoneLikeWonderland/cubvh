@@ -763,9 +763,27 @@ _sparse_marching_cubes(const int* d_coords, const float* d_corners, int N, float
     thrust::exclusive_scan(thrust::cuda::par.on(stream),
                            triCount.begin(), triCount.end(), prefixTri.begin());
 
-    // Compute totals
-    int M = vertCount.empty() ? 0 : (prefixVert.back() + vertCount.back());
-    int T = triCount.empty() ? 0 : (prefixTri.back() + triCount.back());
+    // Compute totals on the caller stream. device_vector::back() performs a
+    // default-stream D2H read, which can race with kernels launched above.
+    int M = 0;
+    int T = 0;
+    if (N > 0) {
+        int h_prefix_vert = 0;
+        int h_vert_count = 0;
+        int h_prefix_tri = 0;
+        int h_tri_count = 0;
+        cudaMemcpyAsync(&h_prefix_vert, thrust::raw_pointer_cast(prefixVert.data()) + (N - 1),
+                        sizeof(int), cudaMemcpyDeviceToHost, stream);
+        cudaMemcpyAsync(&h_vert_count, thrust::raw_pointer_cast(vertCount.data()) + (N - 1),
+                        sizeof(int), cudaMemcpyDeviceToHost, stream);
+        cudaMemcpyAsync(&h_prefix_tri, thrust::raw_pointer_cast(prefixTri.data()) + (N - 1),
+                        sizeof(int), cudaMemcpyDeviceToHost, stream);
+        cudaMemcpyAsync(&h_tri_count, thrust::raw_pointer_cast(triCount.data()) + (N - 1),
+                        sizeof(int), cudaMemcpyDeviceToHost, stream);
+        cudaStreamSynchronize(stream);
+        M = h_prefix_vert + h_vert_count;
+        T = h_prefix_tri + h_tri_count;
+    }
 
     // Free counts early to lower peak memory
     thrust::device_vector<int>().swap(vertCount);

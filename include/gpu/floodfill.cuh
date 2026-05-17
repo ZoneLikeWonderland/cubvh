@@ -1,5 +1,6 @@
 #include <cuda.h>  
 #include <cuda_runtime.h>
+#include <c10/cuda/CUDACachingAllocator.h>
 
 #include <cstdint>
 #include <cmath>
@@ -146,6 +147,19 @@ __global__ void compress(int * __restrict__ labels, int Ntot)
 
 static int divUp(int a, int b) { return (a + b - 1) / b; }
 
+static void* torchCudaMalloc(size_t bytes) {
+    auto allocator = c10::cuda::CUDACachingAllocator::get();
+    return allocator->raw_alloc(bytes);
+}
+
+static void torchCudaFree(void* ptr) {
+    if (ptr == nullptr) {
+        return;
+    }
+    auto allocator = c10::cuda::CUDACachingAllocator::get();
+    allocator->raw_delete(ptr);
+}
+
 /* ------------------------------------------------------------------------- */  
 /*  P U B L I C   A P I                                                      */  
 /* ------------------------------------------------------------------------- */
@@ -172,9 +186,9 @@ void _floodfill_batch(
     int  *d_labels  = nullptr;  
     int  *d_changed = nullptr;
 
-    cudaMalloc(&d_grid,    bytesGrid);  
-    cudaMalloc(&d_labels,  bytesLabel);  
-    cudaMalloc(&d_changed, sizeof(int));
+    d_grid    = static_cast<bool*>(torchCudaMalloc(bytesGrid));
+    d_labels  = static_cast<int*>(torchCudaMalloc(bytesLabel));
+    d_changed = static_cast<int*>(torchCudaMalloc(sizeof(int)));
 
     cudaMemcpyAsync(d_grid, grid, bytesGrid, cudaMemcpyDeviceToDevice, stream);
 
@@ -188,9 +202,9 @@ void _floodfill_batch(
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess) {
             printf("CUDA Error in initLabels: %s\n", cudaGetErrorString(err));
-            cudaFree(d_grid);
-            cudaFree(d_labels);
-            cudaFree(d_changed);
+            torchCudaFree(d_grid);
+            torchCudaFree(d_labels);
+            torchCudaFree(d_changed);
             return;
         }
     }
@@ -269,7 +283,7 @@ void _floodfill_batch(
     cudaStreamSynchronize(stream);
 
     /* cleanup */  
-    cudaFree(d_grid);  
-    cudaFree(d_labels);  
-    cudaFree(d_changed);  
+    torchCudaFree(d_grid);
+    torchCudaFree(d_labels);
+    torchCudaFree(d_changed);
 }  
