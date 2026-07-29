@@ -15,11 +15,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
 // CUDA API
 py::class_<cuBVH>(m, "cuBVH")
-    .def("ray_trace", &cuBVH::ray_trace)
-    .def("unsigned_distance", &cuBVH::unsigned_distance)
-    .def("signed_distance", &cuBVH::signed_distance);
+    .def("ray_trace", &cuBVH::ray_trace, py::call_guard<py::gil_scoped_release>())
+    .def("unsigned_distance", &cuBVH::unsigned_distance, py::call_guard<py::gil_scoped_release>())
+    .def("signed_distance", &cuBVH::signed_distance, py::call_guard<py::gil_scoped_release>());
 
-m.def("create_cuBVH", &create_cuBVH);
+m.def("create_cuBVH", &create_cuBVH, py::call_guard<py::gil_scoped_release>());
 
 m.def("floodfill", &floodfill);
 
